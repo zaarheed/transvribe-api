@@ -1,7 +1,7 @@
 const router = require("express").Router();
-const loadVideo = require("./load-video.api");
+const v1 = require("./v1.api");
 
-router.use("/load-video", loadVideo);
+router.use("/v1", v1);
 
 
 module.exports = router;
