@@ -1,0 +1,14 @@
+node_modules
+.vscode/
+/coverage
+/tmp/
+out/
+.DS_Store
+temp/
+out.html
+
+# dotenv environment variables file
+.env
+.env.live
+.env.development
+.env.staging
