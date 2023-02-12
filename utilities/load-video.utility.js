@@ -7,6 +7,8 @@ const xml2js = require("xml2js");
 const { sql } = require("../utilities/postgres.utility");
 const { generate } = require("../utilities/unique.utility");
 const he = require("he");
+const { Configuration, OpenAIApi } = require("openai");
+const { PineconeClient } = require("pinecone-client");
 
 const USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36";
 const got = _got.extend({
@@ -28,6 +30,26 @@ exports.loadVideo = async function loadVideo({ id = VIDEO_ID } = {}) {
     for (let i = 0; i < transcripts.length; i ++) {
         const { videoId, parts = [] } = transcripts[i];
 
+		const { data } = await youtube.videos.list({
+			id: videoId,
+			part: ["id", "contentDetails", "localizations", "snippet", "status"],
+			maxResults: 1
+		});
+		
+		const { items: videos } = data;
+		const video = videos.pop();
+		const title = video.snippet.title;
+		const author = video.snippet.channelTitle;
+		const thumbUrl = video.snippet.thumbnails.high.url;
+		const id = generate();
+
+		await sql`
+			insert into youtube_videos
+			(id, slug, title, source, type, url, thumb_url, author, youtube_id, created_at)
+			values
+			(${id}, ${id}, ${title}, 'youtube', 'youtube-video', ${`https://www.youtube.com/watch?v=${videoId}`}, ${thumbUrl}, ${author}, ${videoId}, ${new Date()})
+		`;
+
         for (let j = 0; j < parts.length; j ++) {
             let { text, start, dur: duration } = parts[j];
 
@@ -46,36 +68,6 @@ exports.loadVideo = async function loadVideo({ id = VIDEO_ID } = {}) {
     return { videoIds: transcripts.map(({ videoId }) => videoId) };
 }
 
-async function getPlaylistDetails(playlistId, youtubeClient) {
-	const playlist = (
-		await youtubeClient.playlists.list({
-			id: [playlistId],
-			part: ["id", "contentDetails", "localizations", "snippet", "status"],
-			maxResults: 1
-		})
-	).data.items[0]
-
-	let playlistItems = []
-	let playlistItemsPageToken;
-
-	do {
-		const playlistItemsPage = await youtubeClient.playlistItems.list({
-			playlistId,
-			part: ["id", "contentDetails", "snippet", "status"],
-			maxResults: 50,
-			pageToken: playlistItemsPageToken
-		})
-
-		playlistItems = playlistItems.concat(playlistItemsPage.data.items)
-		playlistItemsPageToken = playlistItemsPage.data.nextPageToken
-	} while (playlistItemsPageToken)
-
-	return {
-		playlistId,
-		playlist,
-		playlistItems
-	}
-}
 
 async function getTranscriptsForVideos(videoIds = [], { concurrency = 4 } = {}) {
 	const transcripts = [];
@@ -182,4 +174,160 @@ async function getTranscriptForVideoImpl(videoId) {
 		console.warn("getTranscriptForVideo error", videoId, err.toString())
 		return null
 	}
+}
+
+exports.createEmbeddings = async function createEmbeddings() {
+	const transcriptions = await sql`
+		select * from youtube_video_transcriptions
+		where youtube_video = ${VIDEO_ID}
+	`;
+
+	const videos = await sql`
+		select title from youtube_videos
+		where youtube_id = ${VIDEO_ID}
+	`;
+
+	await saveVideoTranscriptsToPinecone({
+		videoId: VIDEO_ID,
+		transcriptions: transcriptions,
+		videoTitle: videos[0].title
+	});
+}
+
+async function saveVideoTranscriptsToPinecone({ videoId, transcriptions = [], videoTitle }) {
+	const openai = new OpenAIApi(
+		new Configuration({
+			apiKey: process.env.OPENAI_API_KEY
+		})
+	);
+
+	const pinecone = new PineconeClient({
+		apiKey: process.env.PINECONE_API_KEY,
+		baseUrl: process.env.PINECONE_BASE_URL,
+		namespace: process.env.PINECONE_NAMESPACE
+	});
+
+	try {
+		console.log('processing video', videoId, videoTitle);
+
+		const videoEmbeddings = await getEmbeddingsForVideoTranscript({
+			transcriptions: transcriptions,
+			title: videoTitle,
+			videoId: videoId,
+			openai
+		})
+		
+		console.log(videoEmbeddings);
+
+		console.log(
+			'video',
+			videoId,
+			'upserting',
+			videoEmbeddings.length,
+			'vectors'
+		);
+
+		await pinecone.upsert({
+			vectors: videoEmbeddings
+		})
+	} catch (err) {
+		console.warn(
+			'error upserting transcripts for video',
+			videoId,
+			videoTitle,
+			err
+		)
+	}
+
+	return [];
+}
+
+async function getEmbeddingsForVideoTranscript({ transcriptions = [], videoId, title, openai, model = "text-embedding-ada-002", maxInputTokens = 100, concurrency = 4 }) {
+
+	let pendingVectors = [];
+	let currentStart = "";
+	let currentNumTokensEstimate = 0;
+	let currentInput = "";
+	let currentPartIndex = 0;
+	let currentVectorIndex = 0;
+	let isDone = false;
+
+	// Pre-compute the embedding inputs, making sure none of them are too long
+	do {
+		isDone = currentPartIndex >= transcriptions.length
+
+		const part = transcriptions[currentPartIndex];
+
+		const text = unescape(part?.text)
+			.replaceAll('[Music]', '')
+			.replaceAll(/[\t\n]/g, ' ')
+			.replaceAll('  ', ' ')
+			.trim()
+
+		const numTokens = getNumTokensEstimate(text)
+
+		if (!isDone && currentNumTokensEstimate + numTokens < maxInputTokens) {
+			if (!currentStart) {
+				currentStart = part.start
+			}
+
+			currentNumTokensEstimate += numTokens
+			currentInput = `${currentInput} ${text}`
+
+			++currentPartIndex
+		} else {
+			currentInput = currentInput.trim()
+			if (isDone && !currentInput) {
+				break
+			}
+
+			const currentVector = {
+				id: `${videoId}:${currentVectorIndex++}`,
+				input: currentInput,
+				metadata: {
+					title,
+					videoId,
+					text: currentInput,
+					start: currentStart
+				}
+			}
+
+			pendingVectors.push(currentVector)
+
+			// reset current batch
+			currentNumTokensEstimate = 0
+			currentStart = ''
+			currentInput = ''
+		}
+	} while (!isDone)
+
+	// Evaluate all embeddings with a max concurrency
+	let vectors = [];
+	for (let i = 0; i < pendingVectors.length; i++) {
+		const pendingVector = pendingVectors[i];
+		
+		const { data: embed } = await openai.createEmbedding({
+			input: pendingVector.input,
+			model: model
+		})
+
+		const vector = {
+			id: pendingVector.id,
+			metadata: pendingVector.metadata,
+			values: embed.data[0].embedding
+		}
+
+		vectors.push(vector);
+	}
+
+	return vectors;
+}
+
+function getNumTokensEstimate(input) {
+	const numTokens = (input || '')
+		.split(/\s/)
+		.map((token) => token.trim())
+		.filter(Boolean).length
+
+	return numTokens;
 }
