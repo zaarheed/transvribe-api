@@ -1,5 +1,5 @@
 - [x] get transcription from youtube
 - [x] upload transcriptions to Postgres
 - [x] upload transcriptions to pinecone
-- [ ] example question on transcriptions
+- [x] example question on transcriptions
 - [ ] example question filtered by video id metadata
